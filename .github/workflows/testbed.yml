@@ -190,7 +190,7 @@ jobs:
 
       - name: Download tornado artifact
         if: needs.plan.outputs.tornado_artifact != ''
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: ${{ needs.plan.outputs.tornado_artifact }}
           path: tornado-artifact
@@ -259,7 +259,7 @@ jobs:
           persist-credentials: false
 
       - name: Collect per-package results
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           pattern: result-*
           path: collected
@@ -271,7 +271,7 @@ jobs:
       - name: Collect per-package coverage data
         if: needs.plan.outputs.coverage == '1'
         continue-on-error: true
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           pattern: coverage-*
           path: coverage
@@ -284,7 +284,7 @@ jobs:
 
       - name: Download tornado artifact
         if: needs.plan.outputs.coverage == '1' && needs.plan.outputs.tornado_artifact != ''
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: ${{ needs.plan.outputs.tornado_artifact }}
           path: tornado-artifact
