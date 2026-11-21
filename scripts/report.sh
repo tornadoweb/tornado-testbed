@@ -28,7 +28,7 @@ endgroup() { [[ -n "${GITHUB_ACTIONS:-}" ]] && echo "::endgroup::" || true; }
 
 # ── Render the summary ───────────────────────────────────────────────────────
 summary_md="$(python3 - "$RESULTS_DIR" "$TORNADO_SPEC" "$ROOT_DIR" <<'PY'
-import os, sys, glob
+import os, sys, glob, json
 
 results_dir, tornado_spec, root = sys.argv[1], sys.argv[2], sys.argv[3]
 
@@ -47,7 +47,7 @@ try:
 except Exception:
     floors = {}
 
-rows, counts, unlocked = [], {}, []
+rows, counts, unlocked, adjusted = [], {}, [], []
 for path in sorted(glob.glob(os.path.join(results_dir, "*.txt"))):
     if os.path.basename(path) == "summary.txt":
         continue
@@ -64,6 +64,17 @@ for path in sorted(glob.glob(os.path.join(results_dir, "*.txt"))):
     # and a refresh run is unlocked on purpose.
     if kv.get("lock") == "unlocked":
         unlocked.append(name)
+    # Anything that changed what this package's suite checks. A malformed
+    # record is shown as such rather than dropped: hiding it would hide the
+    # very thing this section is for.
+    try:
+        known = json.loads(kv.get("known_failures") or "[]")
+    except ValueError:
+        known = [{"issue": "(unreadable known_failures record)", "action": "?",
+                  "tests": [], "reason": kv.get("known_failures", "")}]
+    patches = kv.get("patches", "").split()
+    if known or patches:
+        adjusted.append((name, patches, known))
     rows.append((name, status, kv.get("exit_code", "?"),
                  kv.get("tornado", "?"), kv.get("test_secs", "?"),
                  kv.get("coverage_pct", "n/a")))
@@ -110,6 +121,27 @@ if unlocked:
                "may be downstream drift rather than Tornado. The `locks` "
                "workflow regenerates `constraints.lock`; each log says why it "
                "was not used.")
+
+# Always listed, green or red: an expected failure that nobody can see is one
+# nobody removes. Each entry stops applying on its own (strict xfail goes red
+# when the test passes; a patch is refused once the pin moves), and this is
+# where a reader sees what is currently being excused and why.
+if adjusted:
+    out.append("")
+    out.append("**Known downstream failures in effect** (not counted as Tornado "
+               "regressions; see each package's `known_failures.toml` and "
+               "`patches/`):")
+    out.append("")
+    for name, patches, known in adjusted:
+        for patch in patches:
+            out.append(f"- `{name}`: patched with `{patch}`")
+        for entry in known:
+            conds = ", ".join(f"{k} `{entry[k]}`" for k in ("tornado", "version")
+                              if k in entry)
+            n = entry.get("matched", len(entry.get("tests", [])))
+            verb = "strict xfail" if entry.get("action") == "xfail" else entry.get("action")
+            out.append(f"- `{name}`: {verb}, {n} test(s), while {conds} — "
+                       f"{entry.get('issue')}: {entry.get('reason')}")
 
 # A floor that sits far below what a package actually covers stops being a
 # check. Nothing else would ever prompt anyone to raise it, so say so here.
@@ -192,8 +224,10 @@ done
 # everything a human needs behind.
 #
 # The harness curates a green baseline: known-bad downstream tests are
-# deselected in each package's test.sh with the reason recorded next to them. So
-# anything other than PASS is a regression to look at, and the gate says so.
+# deselected in each package's test.sh with the reason recorded next to them,
+# and failures from deliberate Tornado changes are strict xfails in
+# known_failures.toml (listed above). So anything other than PASS is a
+# regression to look at, and the gate says so.
 if [[ "${not_passed}" -gt 0 ]]; then
     echo ""
     echo "${not_passed} package(s) did not pass against ${TORNADO_SPEC}."

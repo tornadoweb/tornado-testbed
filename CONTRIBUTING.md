@@ -12,6 +12,13 @@ drift, a missing system tool — gets deselected in that package's `test.sh` wit
 the reason written next to it. A package that is permanently red hides the
 regressions the testbed exists to find, which is worse than not running it.
 
+A failure caused by a *deliberate* Tornado change that downstream has yet to
+adopt (a deprecation turned error, a new secure default) goes in the package's
+`known_failures.toml` as a strict xfail with a condition and an upstream link,
+or, when it is too many tests to list, as a pinned patch of the unreleased
+upstream fix. Both expire on their own. See
+[`packages/README.md`](packages/README.md#known_failurestoml).
+
 The corollary: never make a run green by loosening what it checks. If a genuine
 Tornado failure is inconvenient, that is the testbed working.
 

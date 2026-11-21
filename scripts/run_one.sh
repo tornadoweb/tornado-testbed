@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Run the test suite for a single package (by name) in an isolated
 # uv-managed virtualenv. Each invocation:
-#   1. Creates a fresh .venv under the checkout
+#   1. Applies the package's patches/*.patch to the checkout, if any, and
+#      creates a fresh .venv under it
 #   2. Installs the package (editable with its test extras, or the pinned wheel),
 #      with every other dependency held to packages/<name>/constraints.lock
 #   3. Runs the package's optional setup.sh hook
 #   4. Force-installs the Tornado under test (TORNADO_SPEC)
-#   5. Runs the package's test.sh, streaming output to a log
+#   5. Runs the package's test.sh, streaming output to a log, with the
+#      known_failures.toml entries that apply to this Tornado marked as strict
+#      xfails by scripts/pytest_plugins/testbed_known_failures.py
 #   6. Verifies the Tornado under test is still the one that was installed
 # Exits with the test command's exit code, or one of the status codes below.
 #
@@ -94,6 +97,8 @@ tornado_file="n/a"
 tornado_after="n/a"
 coverage_pct="n/a"
 lock_state="n/a"
+patches_applied=""
+known_failures="[]"
 
 # write_result <status> <exit_code>
 # Single writer for results/<name>.txt so every exit path emits the same schema.
@@ -110,6 +115,11 @@ write_result() {
         echo "test_secs=${test_secs}"
         echo "attempts=${attempts}"
         echo "lock=${lock_state}"
+        # What this run changed about the downstream suite, so the report can
+        # say so next to the verdict. Space-separated patch file names, and the
+        # active known_failures.toml entries as one line of JSON.
+        echo "patches=${patches_applied}"
+        echo "known_failures=${known_failures}"
     } > "${result}"
 }
 
@@ -147,6 +157,29 @@ echo "Timeout:      ${TIMEOUT_SECS}s" | tee -a "${log}"
 echo "" | tee -a "${log}"
 
 install_start=$(date +%s)
+
+# Apply unreleased upstream fixes before installing, so an editable install
+# picks them up. pkglib refuses a patch made for a different pin: once the pin
+# moves, someone has to check whether the new release already has the fix.
+#
+# Checkouts are reused between runs, so a patch already applied by an earlier
+# run (it reverses cleanly) is left alone rather than treated as a conflict.
+if ! patch_list="$(python3 "${PKGLIB}" patches "${name}" 2>&1)"; then
+    die SETUP_FAIL 4 "Refusing to patch: ${patch_list}"
+fi
+if [[ -n "${patch_list}" ]]; then
+    while IFS= read -r patch; do
+        pname="$(basename "${patch}")"
+        if git -C "${checkout}" apply --reverse --check "${patch}" >/dev/null 2>&1; then
+            echo "Patch:        ${pname} (already applied)" | tee -a "${log}"
+        elif git -C "${checkout}" apply "${patch}" >>"${log}" 2>&1; then
+            echo "Patch:        ${pname}" | tee -a "${log}"
+        else
+            die SETUP_FAIL 4 "Patch ${pname} does not apply to ${PKG_REF}"
+        fi
+        patches_applied="${patches_applied:+${patches_applied} }${pname}"
+    done <<<"${patch_list}"
+fi
 
 venv="${checkout}/.venv"
 rm -rf "${venv}"
@@ -274,6 +307,30 @@ if [[ -n "${TORNADO_EXPECT_VERSION}" && "${tornado_ver}" != "${TORNADO_EXPECT_VE
         "Expected tornado ${TORNADO_EXPECT_VERSION} but env has ${tornado_ver}"
 fi
 
+# Known failures are evaluated against the Tornado that is actually importable,
+# not the spec: "only on master" is written as a .dev version bound, and the
+# probe is what says whether this run is on one. pkglib needs `packaging` for
+# the specifiers, which pytest has already brought into the venv.
+if [[ -n "${PKG_KNOWN_FAILURES}" ]]; then
+    if ! known_failures="$(python "${PKGLIB}" known-failures "${name}" "${tornado_ver}" 2>&1)"; then
+        install_secs=$(( $(date +%s) - install_start ))
+        msg="${known_failures}"
+        known_failures="[]"
+        die SETUP_FAIL 4 "Could not evaluate known_failures.toml: ${msg}"
+    fi
+    if [[ "${known_failures}" != "[]" ]]; then
+        kf_active="${venv}/testbed-known-failures.json"
+        kf_applied="${venv}/testbed-known-failures-applied.json"
+        printf '%s\n' "${known_failures}" > "${kf_active}"
+        export TESTBED_KNOWN_FAILURES="${kf_active}"
+        export TESTBED_KNOWN_FAILURES_APPLIED="${kf_applied}"
+        export PYTEST_PLUGINS="testbed_known_failures${PYTEST_PLUGINS:+,${PYTEST_PLUGINS}}"
+        export PYTHONPATH="${ROOT_DIR}/scripts/pytest_plugins${PYTHONPATH:+:${PYTHONPATH}}"
+        echo "Known failures: $(python -c 'import json,sys; print(", ".join(e["issue"] for e in json.load(sys.stdin)))' <<<"${known_failures}")" \
+            | tee -a "${log}"
+    fi
+fi
+
 install_end=$(date +%s)
 install_secs=$((install_end - install_start))
 echo "Install took ${install_secs}s" | tee -a "${log}"
@@ -310,6 +367,12 @@ if [[ "${rc}" -eq 124 && "${RETRY_TIMEOUT}" == "1" ]]; then
 fi
 test_end=$(date +%s)
 test_secs=$((test_end - test_start))
+
+# The plugin's record adds how many tests each entry matched. Without it (the
+# suite died before pytest's summary) the active list stands on its own.
+if [[ -n "${kf_applied:-}" && -s "${kf_applied}" ]]; then
+    known_failures="$(tr -d '\n' < "${kf_applied}")"
+fi
 
 echo "" | tee -a "${log}"
 echo "exit_code=${rc}" | tee -a "${log}"

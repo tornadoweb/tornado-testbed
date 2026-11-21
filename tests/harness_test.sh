@@ -161,6 +161,102 @@ reject "a dependabot.yml entry with no package is rejected" \
                                             "dependabot /packages/alpha /packages/beta /packages/gamma"
 reject "a dependabot.yml glob is rejected"  "dependabot '/packages/*'"
 
+echo "== known_failures.toml and patches =="
+
+# known_failures <root> <name> <toml body> -- write a package's known failures.
+known_failures() { printf '%s\n' "$3" > "$1/packages/$2/known_failures.toml"; }
+kf_ok='[[failure]]
+issue = "https://example.invalid/issues/1"
+reason = "upstream test needs updating for tornado 9"
+tornado = ">=9.0.dev1"
+tests = ["tests/test_x.py::test_broken"]'
+r="$(new_root)"
+make_pkg "${r}" alpha 'true'
+known_failures "${r}" alpha "${kf_ok}"
+out="$(cd "${r}" && python3 scripts/validate_packages.py 2>&1)"
+check "a well-formed known_failures.toml validates" "checked 1 package(s): OK" "${out}"
+out="$(cd "${r}" && python3 scripts/pkglib.py env alpha | grep -c '^PKG_KNOWN_FAILURES=.*known_failures.toml')"
+check "the known failures file is exported to run_one.sh" "1" "${out}"
+
+# The conditions are evaluated with packaging, which a package venv always has
+# (pytest depends on it). Here, only if this python happens to have it too.
+if python3 -c 'import packaging' 2>/dev/null; then
+    out="$(cd "${r}" && python3 scripts/pkglib.py known-failures alpha 9.0.dev1 | grep -c test_broken)"
+    kf_run '' ''
+    check "an entry applies to a .dev tornado inside its bound" "1" "${out}"
+    out="$(cd "${r}" && python3 scripts/pkglib.py known-failures alpha 9.0.1)"
+    if [[ "${out}" == "[]" ]]; then
+        bad "an entry applies to the release after the dev" "got []"
+    else
+        ok "an entry applies to the release after the dev"
+    fi
+    out="$(cd "${r}" && python3 scripts/pkglib.py known-failures alpha 8.5.0)"
+    check "an entry does not apply outside its bound" "[]" "${out}"
+else
+    skip "known-failures condition evaluation" "no packaging in $(command -v python3)"
+fi
+
+reject "a known failure without an issue link is rejected" \
+    "known_failures . beta '[[failure]]
+reason = \"x\"
+tornado = \">=1\"
+tests = [\"tests/test_x.py::test_a\"]'"
+reject "a known failure without a condition is rejected" \
+    "known_failures . beta '[[failure]]
+issue = \"https://example.invalid/1\"
+reason = \"x\"
+tests = [\"tests/test_x.py::test_a\"]'"
+reject "a known failure with a malformed condition is rejected" \
+    "known_failures . beta '[[failure]]
+issue = \"https://example.invalid/1\"
+reason = \"x\"
+tornado = \"master\"
+tests = [\"tests/test_x.py::test_a\"]'"
+reject "an unknown action is rejected" \
+    "known_failures . beta '[[failure]]
+issue = \"https://example.invalid/1\"
+reason = \"x\"
+tornado = \">=1\"
+action = \"skip\"
+tests = [\"tests/test_x.py::test_a\"]'"
+reject "a test that is not a node id is rejected" \
+    "known_failures . beta '[[failure]]
+issue = \"https://example.invalid/1\"
+reason = \"x\"
+tornado = \">=1\"
+tests = [\"test_a\"]'"
+reject "a test listed under two entries is rejected" \
+    "known_failures . beta '[[failure]]
+issue = \"https://example.invalid/1\"
+reason = \"x\"
+tornado = \">=1\"
+tests = [\"tests/test_x.py::test_a\"]
+[[failure]]
+issue = \"https://example.invalid/2\"
+reason = \"y\"
+version = \"<2\"
+tests = [\"tests/test_x.py::test_a\"]'"
+reject "an empty known_failures.toml is rejected" "known_failures . beta ''"
+
+# patch_file <root> <name> <pin> -- a patch that turns test_broken green.
+patch_file() {
+    mkdir -p "$1/packages/$2/patches"
+    {
+        [[ -n "$3" ]] && echo "# pin: $3"
+        echo "# upstream: https://example.invalid/pull/1"
+        printf '%s\n' '--- a/tests/test_x.py' '+++ b/tests/test_x.py' '@@ -1,2 +1,2 @@' \
+            '-def test_broken(): assert False' '+def test_broken(): assert True' \
+            ' def test_ok(): assert True'
+    } > "$1/packages/$2/patches/fix.patch"
+}
+r="$(new_root)"
+make_pkg "${r}" alpha 'true'
+patch_file "${r}" alpha alpha==1.0.0
+out="$(cd "${r}" && python3 scripts/validate_packages.py 2>&1)"
+check "a patch made for the current pin validates" "checked 1 package(s): OK" "${out}"
+reject "a patch made for another pin is rejected" "patch_file . beta beta==0.9.0"
+reject "a patch without a pin header is rejected" "patch_file . beta ''"
+
 echo "== constraints.lock =="
 
 # lock <root> <name> <pin> <python> [requirement...] -- write a lock by hand.
@@ -245,6 +341,21 @@ check "an unlocked package is named in the report" "1" \
     "$(grep -c 'Ran without a current lock.*`loose`' <<<"${out}")"
 # shellcheck disable=SC2016  # literal backticks
 check "a locked package is not" "0" "$(grep -c 'lock.*`tight`' <<<"${out}")"
+
+# Known failures and patches are listed whatever the verdict, and do not change it.
+kfr="$(mktemp -d -p "${TMPROOT}")"
+mkdir -p "${kfr}/results" "${kfr}/logs"
+printf '%s\n' 'package=excused' 'status=PASS' 'exit_code=0' 'patches=fix.patch' \
+    'known_failures=[{"issue": "https://example.invalid/1", "reason": "needs a fix", "action": "xfail", "tests": ["t.py::a"], "tornado": ">=9.0.dev1", "matched": 3}]' \
+    > "${kfr}/results/excused.txt"
+printf '%s\n' 'package=plain' 'status=PASS' 'exit_code=0' 'patches=' 'known_failures=[]' \
+    > "${kfr}/results/plain.txt"
+out="$(RESULTS_DIR="${kfr}/results" LOGS_DIR="${kfr}/logs" "${REPO}/scripts/report.sh" 2>&1)"
+check "known failures do not fail the gate" "0" "$?"
+check "an active known failure is listed with its issue" "1" \
+    "$(grep -c 'excused.*strict xfail, 3 test(s), while tornado .>=9.0.dev1. .*example.invalid/1' <<<"${out}")"
+check "an applied patch is listed" "1" "$(grep -c 'excused.*patched with .fix.patch' <<<"${out}")"
+check "a package with neither is not listed" "0" "$(grep -c '^- .plain' <<<"${out}")"
 
 echo "== changed_packages.sh =="
 
@@ -419,6 +530,78 @@ else
         "$(cd "${r}" && python3 scripts/pkglib.py lock-status subject "${py_minor}")"
     check "a refreshed lock leaves tornado alone" "0" \
         "$(grep -c '^tornado==' "${r}/packages/subject/constraints.lock")"
+
+    # Known failures, applied by the pytest plugin. The stub checkout gets a
+    # real pytest file with one failing and one passing test.
+    # kf_run <toml body or ""> <patch pin or ""> [VAR=value...]
+    # Sets KF_ROOT to the run's root and KF_OUT to "<status> <rc>". Not called
+    # in $(...), so that both survive.
+    kf_run() {
+        local body="$1" pin="${2:-}"; shift 2
+        local r
+        r="$(new_root)"
+        make_pkg "${r}" subject 'python -m pytest -q -p no:cacheprovider tests'
+        mkdir -p "${r}/checkouts/subject/tests"
+        printf '%s\n' 'def test_broken(): assert False' 'def test_ok(): assert True' \
+            > "${r}/checkouts/subject/tests/test_x.py"
+        git -C "${r}/checkouts/subject" init -q
+        [[ -n "${body}" ]] && known_failures "${r}" subject "${body}"
+        [[ -n "${pin}" ]] && patch_file "${r}" subject "${pin}"
+        ( cd "${r}" && env TORNADO_SPEC=tornado COVERAGE=0 "$@" ./scripts/run_one.sh subject >/dev/null 2>&1 )
+        local rc=$?
+        KF_ROOT="${r}"
+        KF_OUT="$(awk -F= '/^status=/ {print $2}' "${r}/results/subject.txt") ${rc}"
+    }
+    kf_entry() {  # kf_entry <tornado specifier> <node id> [action]
+        printf '[[failure]]\nissue = "https://example.invalid/1"\nreason = "r"\ntornado = "%s"\naction = "%s"\ntests = ["%s"]\n' \
+            "$1" "${3:-xfail}" "$2"
+    }
+
+    kf_run '' ''
+    check "without an entry the failing test is FAIL" "FAIL 1" "${KF_OUT}"
+
+    kf_run "$(kf_entry '>=1' tests/test_x.py::test_broken)" ''
+    check "an active entry turns the known failure into a strict xfail" "PASS 0" "${KF_OUT}"
+    check "the result records the entry and how many tests it matched" "1" \
+        "$(grep -c '^known_failures=.*example.invalid/1.*"matched": 1' "${KF_ROOT}/results/subject.txt")"
+    check "the log names the entry" "1" \
+        "$(grep -c '^Known failures: https://example.invalid/1' "${KF_ROOT}/logs/subject.log")"
+
+    # Strict: the day the upstream fix lands, the entry must go.
+    kf_run "$(kf_entry '>=1' tests/test_x.py)" ''
+    check "an entry covering a test that passes is FAIL (XPASS strict)" "FAIL 1" "${KF_OUT}"
+
+    # A rename upstream must not silently turn the entry into a no-op.
+    kf_run "$(kf_entry '>=1' tests/test_x.py::test_renamed)" ''
+    check "an entry matching no collected test is FAIL" "FAIL 4" "${KF_OUT}"
+
+    kf_run "$(kf_entry '<1' tests/test_x.py::test_broken)" ''
+    check "an entry whose condition does not hold is not applied" "FAIL 1" "${KF_OUT}"
+    check "an inactive entry is not recorded" "1" \
+        "$(grep -c '^known_failures=\[\]$' "${KF_ROOT}/results/subject.txt")"
+
+    kf_run "$(kf_entry '>=1' tests/test_x.py::test_broken deselect)" ''
+    check "a deselect entry drops the test" "PASS 0" "${KF_OUT}"
+
+    # Patches: applied before install, refused on a pin mismatch, and left alone
+    # on a reused checkout where an earlier run already applied them.
+    kf_run '' subject==1.0.0
+    check "a patch for the current pin is applied" "PASS 0" "${KF_OUT}"
+    check "the result records the patch" "1" \
+        "$(grep -c '^patches=fix.patch$' "${KF_ROOT}/results/subject.txt")"
+    ( cd "${KF_ROOT}" && TORNADO_SPEC=tornado COVERAGE=0 ./scripts/run_one.sh subject >/dev/null 2>&1 )
+    rc=$?
+    check "an already-applied patch is not a conflict" "PASS 0" \
+        "$(awk -F= '/^status=/ {print $2}' "${KF_ROOT}/results/subject.txt") ${rc}"
+    kf_run '' subject==0.9.0
+    check "a patch for another pin is SETUP_FAIL/4" "SETUP_FAIL 4" "${KF_OUT}"
+    r="$(new_root)"
+    make_pkg "${r}" subject 'true'
+    patch_file "${r}" subject subject==1.0.0
+    ( cd "${r}" && TORNADO_SPEC=tornado COVERAGE=0 ./scripts/run_one.sh subject >/dev/null 2>&1 )
+    rc=$?
+    check "a patch that does not apply is SETUP_FAIL/4" "SETUP_FAIL 4" \
+        "$(awk -F= '/^status=/ {print $2}' "${r}/results/subject.txt") ${rc}"
 
     # uv errors on a constraints file that is not there, so pointing at one
     # unconditionally turned every install into an INSTALL_FAIL. A checkout

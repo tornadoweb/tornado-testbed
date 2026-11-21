@@ -14,6 +14,8 @@ packages/<name>/
   setup.sh           optional post-install hook
   README.md          what it exercises, and why its suite is shaped that way
   constraints.lock   generated: every other dependency, frozen (see below)
+  known_failures.toml  optional: tests expected to fail under a condition
+  patches/*.patch    optional: unreleased upstream fixes, pinned to one release
 ```
 
 ### requirements.txt
@@ -105,6 +107,85 @@ lists those packages.
 It is not `*.txt` on purpose: dependabot reads every `.txt` in a directory it
 watches as a requirements file, and would open a pull request per locked
 transitive dependency.
+
+### known_failures.toml
+
+For a downstream test that fails because of a **deliberate** Tornado change
+that downstream has not caught up with yet: a deprecation that became an
+error, a new secure default. The failure is real and expected, it is
+downstream's to fix, and leaving it red would hide the next real regression
+in the same package.
+
+```toml
+[[failure]]
+issue = "https://github.com/mher/flower/issues/NNNN"   # upstream issue or fix
+reason = "expects cross-site POSTs to reach the unauthenticated API"
+tornado = ">=6.7.dev1"      # PEP 440 specifier on the Tornado under test
+version = "==2.2.0"         # specifier on this package's pin
+action = "xfail"            # the default; "deselect" only for hangs/flakes
+tests = [
+    "tests/unit/views/test_xsrf.py::XsrfProtectionTests::test_unauthenticated_server_allows_cross_site",
+]
+```
+
+- **Every entry needs a condition** (`tornado`, `version`, or both) and
+  applies only while all of them hold. "Only on master" is a `.dev` bound
+  such as `>=6.7.dev1`; it is checked against the Tornado that is actually
+  importable in the venv, not the spec that was asked for, and pre-releases
+  always count. A `version` bound makes the entry lapse when dependabot moves
+  the pin, so the next release is tested without it.
+- **`xfail` is strict.** A listed test that passes fails the run. That is how
+  an entry gets removed: the day the downstream fix ships, the package goes
+  red until someone deletes the entry. Use `deselect` only for a test that
+  hangs or is flaky under the condition, where an xfail could not give a
+  stable answer; it has no such expiry, so lean on the `version` bound.
+- **Tests are pytest node ids**, matched exactly or as a prefix ending at a
+  parametrization, class or file. An id that matches nothing collected
+  (renamed upstream, or already deselected in `test.sh`) fails the run with
+  pytest's usage-error code, 4.
+- **Every active entry is printed** in the run's log, in pytest's terminal
+  summary, and in the report under "Known downstream failures in effect",
+  whether the package passed or not.
+
+`run_one.sh` evaluates the conditions with `pkglib` and hands the active
+entries to `scripts/pytest_plugins/testbed_known_failures.py`, which it loads
+through `PYTEST_PLUGINS` only when there is something to apply.
+
+**known_failures.toml or a `test.sh` deselect?** A test that fails on every
+Tornado (downstream's own flakiness, dependency drift) is not Tornado's
+business at all and stays a deselect in `test.sh`, with its reason above it.
+`known_failures.toml` is for failures caused by a Tornado change, which should
+stop being excused once downstream catches up.
+
+### patches/
+
+When an upstream fix is merged but not released, and the failures it fixes are
+too many to enumerate without losing real coverage, the fix can be applied to
+the checkout instead. `run_one.sh` applies `patches/*.patch` (in name order)
+with `git apply` before installing, so an editable install picks them up.
+
+```
+# pin: jupyter_server==2.21.1
+# upstream: https://github.com/jupyter-server/jupyter_server/pull/1717
+#
+# why, in a few lines
+diff --git a/tests/...
+```
+
+- **A patch is made for one pin.** `validate_packages.py` rejects one whose
+  `# pin:` is not the current pin, and `run_one.sh` refuses it with
+  `SETUP_FAIL`. So the pin bump's own pull request fails until someone checks
+  whether the new release has the fix and deletes or regenerates the patch.
+- **Patch tests, not downstream's runtime code.** A patch to code that talks
+  to Tornado could hide exactly the regression the testbed is for. Take the
+  smallest upstream commit that fixes the Tornado-related failures and leave
+  unrelated commits out.
+- A patch that does not apply is `SETUP_FAIL`. A checkout where an earlier run
+  already applied it (it reverses cleanly) is left as it is.
+- Applied patches are listed in the report alongside known failures.
+
+Prefer `known_failures.toml` for a handful of tests. Reach for a patch when an
+xfail list would be long enough to switch off a real part of the suite.
 
 ## Selection criteria
 

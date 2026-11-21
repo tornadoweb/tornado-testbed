@@ -20,6 +20,13 @@ Each package is a directory, packages/<name>/, holding:
                       run (see LOCK_MODE in run_one.sh). Applied as uv
                       constraints so drift arrives in one reviewable pull
                       request instead of in the weekly or release run.
+    known_failures.toml
+                      optional: downstream tests known to fail under some
+                      Tornado or downstream versions, each tied to an upstream
+                      issue and a condition. Applied by the pytest plugin in
+                      scripts/pytest_plugins/ as strict xfails.
+    patches/*.patch   optional: upstream fixes not yet released, each made
+                      for exactly one pin and refused once the pin moves.
 
 The git tag is derived, not stored: tag_template applied to the version in
 requirements.txt. Storing both invites them to disagree.
@@ -37,6 +44,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tomllib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PKGDEFS_DIR = ROOT / "packages"
@@ -71,6 +79,26 @@ LOCK_NAME = "constraints.lock"
 # install unsatisfiable, or pin a dependency the new release no longer accepts.
 LOCK_PIN_RE = re.compile(r"^# pin: (?P<pin>\S+)$")
 LOCK_PYTHON_RE = re.compile(r"^# python: (?P<python>\d+\.\d+)$")
+
+# Known failures: see packages/README.md#known_failurestoml.
+KNOWN_FAILURES_NAME = "known_failures.toml"
+KNOWN_FAILURE_REQUIRED = {"issue", "reason", "tests"}
+# The conditions. An entry applies only while every condition it names holds,
+# and must name at least one: an unconditional entry never expires.
+KNOWN_FAILURE_CONDITIONS = {"tornado", "version"}
+KNOWN_FAILURE_KEYS = KNOWN_FAILURE_REQUIRED | KNOWN_FAILURE_CONDITIONS | {"action"}
+# xfail is the default and the norm: strict, so a test that starts passing
+# turns the run red and the entry gets removed. deselect is only for tests that
+# hang or are flaky, where an xfail would be a timeout or a coin toss.
+KNOWN_FAILURE_ACTIONS = {"xfail", "deselect"}
+# A pytest node id, or a prefix of one ending at a file, class or test name.
+NODEID_RE = re.compile(r"^[^\s:\[\]]+\.py(::[A-Za-z_][A-Za-z0-9_]*)*$")
+
+# Patches: see packages/README.md#patches. Header lines before the diff, which
+# git apply ignores.
+PATCHES_DIR = "patches"
+PATCH_PIN_RE = re.compile(r"^# pin: (?P<pin>\S+)$")
+PATCH_UPSTREAM_RE = re.compile(r"^# upstream: (?P<upstream>https://\S+)$")
 
 
 def normalize(dist: str) -> str:
@@ -119,6 +147,16 @@ class Package:
         path = self.directory / "setup.sh"
         return path if path.exists() else None
 
+    @property
+    def known_failures(self) -> pathlib.Path | None:
+        path = self.directory / KNOWN_FAILURES_NAME
+        return path if path.exists() else None
+
+    @property
+    def patches(self) -> list[pathlib.Path]:
+        """Patches to apply to the checkout, in the order they apply."""
+        return sorted((self.directory / PATCHES_DIR).glob("*.patch"))
+
     def shell_env(self) -> str:
         """Shell assignments for `eval "$(pkglib.py env <name>)"`."""
         pairs = {
@@ -138,6 +176,7 @@ class Package:
             "PKG_TEST_SH": str(self.directory / "test.sh"),
             "PKG_SETUP_SH": str(self.setup_hook or ""),
             "PKG_LOCK": str(self.lock),
+            "PKG_KNOWN_FAILURES": str(self.known_failures or ""),
         }
         return "\n".join(f"{k}={shlex.quote(v)}" for k, v in pairs.items())
 
@@ -252,6 +291,168 @@ def render_lock(pkg: Package, python: str, freeze: str) -> str:
         *reqs,
     ]
     return "\n".join(lines) + "\n"
+
+
+def _check_specifier(path: pathlib.Path, where: str, spec: object) -> None:
+    """Reject a condition that is not a PEP 440 specifier set.
+
+    Checked properly when `packaging` is importable (it always is inside a
+    package's venv, where the conditions are evaluated); otherwise only the
+    shape is checked, so validation stays dependency-free.
+    """
+    if not isinstance(spec, str) or not spec.strip():
+        raise PackageError(f"{path}: {where} must be a non-empty version specifier")
+    try:
+        from packaging.specifiers import InvalidSpecifier, SpecifierSet
+    except ImportError:
+        if not re.match(r"^\s*(~=|===?|!=|<=?|>=?)", spec):
+            raise PackageError(
+                f"{path}: {where} must be a version specifier such as '>=6.7.dev1', "
+                f"got {spec!r}"
+            ) from None
+        return
+    try:
+        SpecifierSet(spec)
+    except InvalidSpecifier:
+        raise PackageError(
+            f"{path}: {where} must be a version specifier such as '>=6.7.dev1', "
+            f"got {spec!r}"
+        ) from None
+
+
+def parse_known_failures(path: pathlib.Path) -> list[dict]:
+    """The entries of a known_failures.toml, validated, with defaults filled in."""
+    try:
+        data = tomllib.loads(path.read_text())
+    except tomllib.TOMLDecodeError as exc:
+        raise PackageError(f"{path}: {exc}") from None
+    unknown = set(data) - {"failure"}
+    if unknown:
+        raise PackageError(
+            f"{path}: unknown top-level key(s): {', '.join(sorted(unknown))}; "
+            "each entry is a [[failure]] table"
+        )
+    entries = data.get("failure", [])
+    if not isinstance(entries, list) or not entries:
+        raise PackageError(f"{path}: no [[failure]] entries; delete the file instead")
+    out = []
+    seen: dict[str, int] = {}
+    for i, entry in enumerate(entries, 1):
+        where = f"[[failure]] #{i}"
+        unknown = set(entry) - KNOWN_FAILURE_KEYS
+        if unknown:
+            raise PackageError(f"{path}: {where}: unknown key(s): {', '.join(sorted(unknown))}")
+        missing = KNOWN_FAILURE_REQUIRED - set(entry)
+        if missing:
+            raise PackageError(f"{path}: {where}: missing key(s): {', '.join(sorted(missing))}")
+        if not isinstance(entry["issue"], str) or not entry["issue"].startswith("https://"):
+            raise PackageError(f"{path}: {where}: issue must be an https:// link to the upstream issue or fix")
+        if not isinstance(entry["reason"], str) or not entry["reason"].strip():
+            raise PackageError(f"{path}: {where}: reason must say why this is not a Tornado regression")
+        conditions = KNOWN_FAILURE_CONDITIONS & set(entry)
+        if not conditions:
+            raise PackageError(
+                f"{path}: {where}: needs at least one condition "
+                f"({', '.join(sorted(KNOWN_FAILURE_CONDITIONS))}) so it stops applying"
+            )
+        for key in sorted(conditions):
+            _check_specifier(path, f"{where}: {key}", entry[key])
+        action = entry.get("action", "xfail")
+        if action not in KNOWN_FAILURE_ACTIONS:
+            raise PackageError(
+                f"{path}: {where}: action must be one of {sorted(KNOWN_FAILURE_ACTIONS)}, got {action!r}"
+            )
+        tests = entry["tests"]
+        if not isinstance(tests, list) or not tests:
+            raise PackageError(f"{path}: {where}: tests must be a non-empty list of pytest node ids")
+        for test in tests:
+            if not isinstance(test, str) or not NODEID_RE.match(test):
+                raise PackageError(
+                    f"{path}: {where}: {test!r} is not a pytest node id "
+                    "(path/to/test_x.py[::Class]::test_name)"
+                )
+            # One test under two entries would make which issue explains it,
+            # and which entry expires it, ambiguous.
+            if test in seen:
+                raise PackageError(
+                    f"{path}: {where}: {test} is already listed in [[failure]] #{seen[test]}"
+                )
+            seen[test] = i
+        out.append(
+            {
+                "issue": entry["issue"],
+                "reason": entry["reason"].strip(),
+                "action": action,
+                "tests": list(tests),
+                **{key: entry[key] for key in sorted(conditions)},
+            }
+        )
+    return out
+
+
+def active_known_failures(pkg: Package, tornado_version: str) -> list[dict]:
+    """The entries whose conditions hold for this pin and this Tornado.
+
+    `tornado_version` is what run_one.sh found importable after installing the
+    Tornado under test, not the spec it asked for. Pre-releases always count:
+    master is a .dev version, and a specifier like '>=6.7' must match it.
+    Needs `packaging`, so it runs with the package venv's python.
+    """
+    from packaging.specifiers import SpecifierSet
+
+    if pkg.known_failures is None:
+        return []
+    have = {"tornado": tornado_version, "version": pkg.version}
+    return [
+        entry
+        for entry in parse_known_failures(pkg.known_failures)
+        if all(
+            SpecifierSet(entry[key]).contains(have[key], prereleases=True)
+            for key in KNOWN_FAILURE_CONDITIONS & set(entry)
+        )
+    ]
+
+
+def parse_patch_header(path: pathlib.Path) -> dict[str, str]:
+    """{"pin": ..., "upstream": ...} from the comment lines before the diff."""
+    header: dict[str, str] = {}
+    for line in path.read_text().splitlines():
+        if not line.startswith("#"):
+            break
+        for key, regex in (("pin", PATCH_PIN_RE), ("upstream", PATCH_UPSTREAM_RE)):
+            match = regex.match(line)
+            if match:
+                header[key] = match.group(key)
+    for key, example in (("pin", "name==version"), ("upstream", "https://...")):
+        if key not in header:
+            raise PackageError(f"{path}: missing '# {key}: {example}' header line")
+    return header
+
+
+def check_patches(pkg: Package) -> list[str]:
+    """A patch made for another pin must not be applied to this one.
+
+    The point of pinning a patch is that it stops applying the moment the pin
+    moves: the new release may already contain the fix, in which case the patch
+    is dead weight, or may not, in which case it needs re-checking. Either way a
+    person has to look, so this fails the pin bump's own pull request.
+    """
+    problems = []
+    for patch in pkg.patches:
+        try:
+            header = parse_patch_header(patch)
+        except PackageError as exc:
+            problems.append(f"{pkg.name}: {exc}")
+            continue
+        if header["pin"] != pkg.pin:
+            problems.append(
+                f"{pkg.name}: {PATCHES_DIR}/{patch.name} was made for {header['pin']}, "
+                f"but the pin is now {pkg.pin}. Check whether {pkg.pin} includes "
+                f"{header['upstream']}; if it does, delete the patch (and any "
+                f"known_failures.toml entry it made unnecessary), otherwise "
+                f"regenerate it against the new tag."
+            )
+    return problems
 
 
 def load(name: str) -> Package:
@@ -394,6 +595,12 @@ def check_files(pkg: Package) -> list[str]:
             # Tornado under test; one on the package itself would fight the pin.
             for dist in sorted(held & {"tornado", normalize(pkg.dist_name)}):
                 problems.append(f"{pkg.name}: {LOCK_NAME} must not constrain {dist}")
+    if pkg.known_failures is not None:
+        try:
+            parse_known_failures(pkg.known_failures)
+        except PackageError as exc:
+            problems.append(f"{pkg.name}: {exc}")
+    problems.extend(check_patches(pkg))
     if pkg.install_method == "pypi" and pkg.dist_name != pkg.name:
         # Not fatal, but the pypi install path installs requirements.txt by
         # name, so a mismatch is worth stating out loud.
@@ -455,6 +662,19 @@ def main(argv: list[str]) -> int:
             # write-lock <name> <python-major.minor>, `uv pip freeze` on stdin.
             pkg = resolve(args[0])
             pkg.lock.write_text(render_lock(pkg, args[1], sys.stdin.read()))
+        elif cmd == "known-failures":
+            # known-failures <name> <tornado-version> -> JSON list of the
+            # entries that apply. Run with the package venv's python.
+            print(json.dumps(active_known_failures(resolve(args[0]), args[1])))
+        elif cmd == "patches":
+            # patches <name> -> one patch path per line; fails if any patch was
+            # made for a different pin.
+            pkg = resolve(args[0])
+            problems = check_patches(pkg)
+            if problems:
+                raise PackageError("; ".join(problems))
+            for patch in pkg.patches:
+                print(patch)
         elif cmd == "refs":
             for pkg in load_all():
                 print(f"{pkg.name}\t{pkg.dist_name}=={pkg.version}\t{pkg.ref}")
