@@ -178,6 +178,16 @@ mind before assuming a number can simply be pushed up.
 
 ## Gotchas worth knowing if you extend the harness
 
+- **Known failures are strict, conditional, and visible.** A downstream test
+  broken by a deliberate Tornado change goes in that package's
+  `known_failures.toml` as a strict xfail with an upstream link and a
+  `tornado`/`version` condition; when the fix is too many tests to list, the
+  unreleased upstream fix goes in `patches/`, pinned to one release. Both stop
+  applying on their own, and the report lists every active one. Don't
+  broaden a node id to a whole file to save typing: strict xfail on a file
+  means every test in it must fail. See
+  [`packages/README.md`](packages/README.md#known_failurestoml).
+
 - **`scripts/common.sh` enables `set -e`.** Guard any command whose non-zero
   exit you intend to handle (`run_tests || rc=$?`). An unguarded failure aborts
   before the result file is written, which makes a red package invisible to the

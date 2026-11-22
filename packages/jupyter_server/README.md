@@ -43,13 +43,18 @@ normal run does:
 
 ```bash
 sed -i 's/^jupyter_server==.*/jupyter_server==2.14.2/' packages/jupyter_server/requirements.txt
+mv packages/jupyter_server/patches /tmp/jupyter_server-patches   # made for the real pin
 rm -rf checkouts/jupyter_server && ./scripts/setup.sh jupyter_server
 
 TORNADO_SPEC="tornado==6.5.9"  ./scripts/run_one.sh jupyter_server   # must FAIL, 4 tests
 TORNADO_SPEC="tornado==6.5.10" ./scripts/run_one.sh jupyter_server   # must PASS
 
 git checkout packages/jupyter_server/requirements.txt
+mv /tmp/jupyter_server-patches packages/jupyter_server/patches
 ```
+
+(The patch has to move aside: it is pinned to the current release, and
+`run_one.sh` refuses it on any other pin with `SETUP_FAIL`.)
 
 The 6.5.9 run should show
 `AttributeError: 'FileFindHandler' object has no attribute
@@ -66,3 +71,35 @@ Every `--deselect` in `test.sh` carries its reason inline. They fall into two
 kinds: jupyter_server's own order-dependent or subprocess-launching tests, and
 one case of dependency drift that is red on every Tornado version. Both would
 otherwise make this package permanently red and hide real regressions.
+
+## Patch: PR 1717, until the next release
+
+`patches/pr1717-request-start-line.patch` is the first commit of
+[jupyter_server#1717](https://github.com/jupyter-server/jupyter_server/pull/1717),
+merged upstream but not in 2.21.1. Tornado 6.6 deprecated building an
+`HTTPServerRequest` from method/uri/version and master (6.7) requires
+`start_line`. jupyter_server's own tests build requests the old way, so on
+master **42 tests** fail before reaching what they test: the
+`allow_origin_pat` bypass tests, `check_xsrf_cookie`, the static handler
+(including `follow_dir_symlinks`), websocket pings and the kernel connection.
+
+Measured on master 494aee6 with coverage on:
+
+| | result | tornado coverage |
+|---|---|---|
+| unpatched | 38 failed, 4 errors, 1105 passed | not recorded |
+| strict xfail of the 42 | 42 xfailed, 1104 passed | 42% |
+| this patch | 1147 passed | 42% |
+
+Line coverage hardly moves, because the live-server tests reach the same code,
+but an xfail list would switch off the assertions in exactly the tests closest
+to Tornado's security-sensitive behaviour. The patch changes only test files,
+so jupyter_server's runtime code is tested as released. It also passes on
+tornado 6.6.1, so the release gate for 6.6.x is unaffected. (Both the xfail
+run and the 6.6.1 run hit the known `test_restart_kernel[jp_server_config0]`
+timing flake described in `REPORT.md`; it is unrelated to the patch.)
+
+PR 1717's other commit (trash on a tmpfs `/tmp`) has nothing to do with Tornado
+and does not fail here, so it is left out. The patch is pinned to 2.21.1:
+dependabot's next bump fails `validate_packages.py` until someone confirms the
+new release contains the fix and deletes the patch.
