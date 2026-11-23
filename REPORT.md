@@ -33,7 +33,8 @@ the full run made when mitmproxy was added,
 jupyter_server had one failure, `test_restart_kernel[jp_server_config0]`: it
 gives a closed WebSocket one second to drop out of the kernel's connection
 count, which it missed under load, and it passed 3/3 when re-run on its own.
-Watch for it recurring before deselecting it. Full output is in
+It kept recurring, on stable Tornado and master alike, so it is now deselected
+in `packages/jupyter_server/test.sh`. Full output is in
 `logs/<package>.log`; machine-readable results in `results/<package>.txt`; the
 table is reproducible with `scripts/summarize.sh`.
 

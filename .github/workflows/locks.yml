@@ -21,8 +21,9 @@
 #
 # Requires "Allow GitHub Actions to create and approve pull requests" in the
 # repository's Actions settings. Note that a pull request opened with
-# GITHUB_TOKEN does not trigger other workflows, so lint and pins do not run on
-# it; the refresh run linked from its description is its test result.
+# GITHUB_TOKEN does not trigger other workflows automatically: lint and pins
+# wait until a maintainer clicks "Approve and run workflows" on the pull
+# request. The refresh run linked from its description is its test result.
 name: locks
 
 on:
@@ -155,9 +156,10 @@ jobs:
               echo ""
               printf '%s\n' "${missing}"
             fi
-            echo "Opened by the \`locks\` workflow. Workflows do not run on pull"
-            echo "requests opened with GITHUB_TOKEN, so lint and pins have not run"
-            echo "here; the run linked above is the test result."
+            echo "Opened by the \`locks\` workflow. Workflows do not start on their"
+            echo "own for pull requests opened with GITHUB_TOKEN: click **Approve and"
+            echo "run workflows** to run lint and pins before merging. The refresh run"
+            echo "linked above is the test result."
           } > body.md
 
           title="Refresh dependency locks"

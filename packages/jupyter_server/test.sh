@@ -38,6 +38,14 @@ args=(
     --deselect tests/test_serverapp.py::test_urls
     --deselect tests/test_serverapp.py::test_browser_open_files
 
+    # Timing flake, red on every Tornado version: after restarting the kernel
+    # it gives a closed WebSocket one second to drop out of the kernel's
+    # connection count, and under load it misses that window ("assert 1 == 0").
+    # Passes on its own; it failed in roughly half the full runs on 6.6.1 and
+    # master alike, and kept failing the weekly run. Upstream already marks it
+    # flaky on Windows for the same reason.
+    --deselect 'tests/services/sessions/test_api.py::test_restart_kernel[jp_server_config0]'
+
     # Dependency drift, red on every Tornado version: it calls
     # check_version(1.0, ...) with a float, and current packaging raises
     # InvalidVersion where it used to raise the TypeError check_version catches.
