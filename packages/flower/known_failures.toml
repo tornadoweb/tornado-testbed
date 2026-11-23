@@ -1,0 +1,7 @@
+[[failure]]
+issue = "https://github.com/tornadoweb/tornado/pull/3809"
+reason = "the unauthenticated API deliberately accepts cross-site POSTs; tornado 6.7 blocks them by default until flower opts out"
+tornado = ">=6.7.dev1"
+tests = [
+    "tests/unit/views/test_xsrf.py::XsrfProtectionTests::test_unauthenticated_server_allows_cross_site",
+]
