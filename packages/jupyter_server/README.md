@@ -68,8 +68,9 @@ at all; it is already there.)
 ## Deselects
 
 Every `--deselect` in `test.sh` carries its reason inline. They fall into two
-kinds: jupyter_server's own order-dependent or subprocess-launching tests, and
-one case of dependency drift that is red on every Tornado version. Both would
+kinds: jupyter_server's own order-dependent, timing-sensitive or
+subprocess-launching tests, and one case of dependency drift that is red on
+every Tornado version. Both would
 otherwise make this package permanently red and hide real regressions.
 
 ## Patch: PR 1717, until the next release
